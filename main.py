@@ -19,9 +19,7 @@ app.add_middleware(
 )
 
 # Face detector
-mtcnn = MTCNN(keep_all=False)
-
-mtcnn_video = MTCNN(keep_all = True)
+mtcnn = MTCNN(keep_all=True)
 
 # Load your model pipeline
 pipe = pipeline(
@@ -44,31 +42,46 @@ async def predict(file: UploadFile = File(...)):
         contents = await file.read()
         image = Image.open(io.BytesIO(contents)).convert("RGB")
 
-        box, _ = mtcnn.detect(image)
+        boxes, _ = mtcnn.detect(image)
 
-        if box is None:
+        if boxes is None:
             return JSONResponse(content={"error": "No face detected"})
 
-        x1, y1, x2, y2 = map(int, box[0])
-        face = image.crop((x1, y1, x2, y2))
-
-        preds = pipe(face)
-        top_pred = preds[0]
-
-        # Draw result
+        predictions = []
         draw = ImageDraw.Draw(image)
-        draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
-        draw.text((x1, y1 - 10), f"{top_pred['label']} ({top_pred['score']:.2f})", fill="red")
 
-        # Encode image as base64
+        for i, box in enumerate(boxes):
+            x1, y1, x2, y2 = map(int, box)
+            face = image.crop((x1, y1, x2, y2))
+
+            # Run classification
+            preds = pipe(face)
+            top_pred = preds[0]
+
+            # Encode cropped face
+            buf_face = io.BytesIO()
+            face.save(buf_face, format="PNG")
+            face_str = base64.b64encode(buf_face.getvalue()).decode("utf-8")
+
+            predictions.append({
+                "face_id": i,
+                "label": top_pred['label'],
+                "score": float(top_pred['score']),
+                "all_predictions": preds,
+                "face_image_base64": face_str
+            })
+
+            # Draw on the full image
+            draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
+            draw.text((x1, y1 - 10), f"{top_pred['label']} ({top_pred['score']:.2f})", fill="red")
+
+        # Encode annotated full image
         buf = io.BytesIO()
         image.save(buf, format="PNG")
         img_str = base64.b64encode(buf.getvalue()).decode("utf-8")
 
         return {
-            "label": top_pred['label'],
-            "score": float(top_pred['score']),
-            "all_predictions": preds,
+            "faces": predictions,
             "image_base64": img_str
         }
 
