@@ -1,4 +1,4 @@
-FROM jrottenberg/ffmpeg:5.1-slim as ffmpeg
+FROM jrottenberg/ffmpeg:5.1-slim AS ffmpeg
 
 FROM python:3.11-slim
 WORKDIR /app
@@ -29,4 +29,4 @@ RUN mkdir -p /tmp && chmod 777 /tmp
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --log-level info"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --reload --log-level info"]

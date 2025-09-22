@@ -99,8 +99,9 @@ async def predict(file: UploadFile = File(...)):
 async def predict_video(file: UploadFile = File(...), frame_skip: int = 5, request: Request = None):
     """
     Process a video frame by frame and detect emotions.
-    - frame_skip: run detection every Nth frame (default=5) but keep boxes/labels visible on all frames.
+    Uses FFmpeg for web-compatible output.
     """
+    import subprocess
 
     try:
         # Save uploaded video temporarily
@@ -108,28 +109,38 @@ async def predict_video(file: UploadFile = File(...), frame_skip: int = 5, reque
         temp_input.write(await file.read())
         temp_input.close()
 
-        # Open video
+        # Create temporary directory for frame processing
+        temp_frames_dir = tempfile.mkdtemp()
+        
+        # Open video to get properties
         cap = cv2.VideoCapture(temp_input.name)
         if not cap.isOpened():
             return JSONResponse(status_code=400, content={"error": "Could not open video"})
 
-        # Output video writer - Use H.264 codec for better compatibility
-        fourcc = cv2.VideoWriter_fourcc(*"H264")  # Changed from mp4v to H264
         fps = cap.get(cv2.CAP_PROP_FPS)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        temp_output = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        out = cv2.VideoWriter(temp_output.name, fourcc, fps, (width, height))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        print(f"Video properties: {width}x{height}, {fps} FPS, {total_frames} frames")
 
         frame_idx = 0
-        last_predictions = []  # store last known predictions
-        # Try loading a bundled font or fall back to default
+        last_predictions = []
+        processed_frames = 0
+        
+        # Try loading a font or fall back to default
         try:
-            font = ImageFont.truetype("fonts/DejaVuSans.ttf", size=36)  # much bigger
+            font = ImageFont.truetype("arial.ttf", size=36)
         except:
-            font = ImageFont.load_default()
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size=36)
+            except:
+                try:
+                    font = ImageFont.load_default()
+                except:
+                    font = None
 
+        # Process frames and save as images
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -145,75 +156,167 @@ async def predict_video(file: UploadFile = File(...), frame_skip: int = 5, reque
                     last_predictions = []
                     for box in boxes:
                         x1, y1, x2, y2 = map(int, box)
-                        face = image.crop((x1, y1, x2, y2))
-                        preds = pipe(face)
-                        top_pred = preds[0]
-                        last_predictions.append((box, top_pred))
+                        # Ensure coordinates are within image bounds
+                        x1 = max(0, x1)
+                        y1 = max(0, y1)
+                        x2 = min(image.width, x2)
+                        y2 = min(image.height, y2)
+                        
+                        if x2 > x1 and y2 > y1:
+                            face = image.crop((x1, y1, x2, y2))
+                            preds = pipe(face)
+                            top_pred = preds[0]
+                            last_predictions.append((box, top_pred))
 
-           # Draw last known predictions (so boxes/labels persist)
+            # Draw predictions
             for box, top_pred in last_predictions:
                 x1, y1, x2, y2 = map(int, box)
                 label_text = f"{top_pred['label']} ({top_pred['score']:.2f})"
 
-                # Measure text size (Pillow >= 10)
-                bbox = font.getbbox(label_text)
-                text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                if font:
+                    try:
+                        bbox = font.getbbox(label_text)
+                        text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                    except AttributeError:
+                        text_w, text_h = font.getsize(label_text)
+                else:
+                    text_w, text_h = len(label_text) * 10, 20
 
-                # Draw filled rectangle for background
-                draw.rectangle([x1, y1 - text_h - 6, x1 + text_w + 6, y1], fill="red")
-
-                # Draw text on top of it
-                draw.text((x1 + 3, y1 - text_h - 3), label_text, font=font, fill="white")
-
+                # Draw background rectangle
+                bg_x1 = max(0, x1)
+                bg_y1 = max(0, y1 - text_h - 6)
+                bg_x2 = min(image.width, x1 + text_w + 6)
+                bg_y2 = max(0, y1)
+                
+                draw.rectangle([bg_x1, bg_y1, bg_x2, bg_y2], fill="red")
+                
+                # Draw text
+                text_x = max(3, x1 + 3)
+                text_y = max(3, y1 - text_h - 3)
+                draw.text((text_x, text_y), label_text, font=font, fill="white")
+                
                 # Draw bounding box
-                draw.rectangle([x1, y1, x2, y2], outline="red", width=4)
+                box_x1 = max(0, x1)
+                box_y1 = max(0, y1)
+                box_x2 = min(image.width, x2)
+                box_y2 = min(image.height, y2)
+                draw.rectangle([box_x1, box_y1, box_x2, box_y2], outline="red", width=4)
 
-            # Convert back to OpenCV frame
-            frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-            out.write(frame)
+            # Save processed frame
+            frame_path = os.path.join(temp_frames_dir, f"frame_{frame_idx:06d}.jpg")
+            image.save(frame_path, "JPEG", quality=95)
+            
             frame_idx += 1
+            processed_frames += 1
+            
+            if processed_frames % 30 == 0:
+                print(f"Processed {processed_frames}/{total_frames} frames")
 
         cap.release()
-        out.release()
+        
+        # Create web-compatible video using FFmpeg
+        temp_output = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        temp_output_path = temp_output.name
+        temp_output.close()
 
-        file_path = temp_output.name
-        file_size = os.path.getsize(file_path)
+        # FFmpeg command for web-compatible MP4
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-framerate", str(fps),
+            "-i", os.path.join(temp_frames_dir, "frame_%06d.jpg"),
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",  # Enable web streaming
+            "-y",  # Overwrite output
+            temp_output_path
+        ]
 
-        range_header = request.headers.get("range")
+        print(f"Running FFmpeg command: {' '.join(ffmpeg_cmd)}")
+        
+        result = subprocess.run(
+            ffmpeg_cmd, 
+            capture_output=True, 
+            text=True, 
+            timeout=300  # 5 minute timeout
+        )
+        
+        if result.returncode != 0:
+            print(f"FFmpeg stderr: {result.stderr}")
+            return JSONResponse(status_code=500, content={
+                "error": f"FFmpeg failed: {result.stderr}"
+            })
+
+        # Clean up frame files
+        for frame_file in os.listdir(temp_frames_dir):
+            os.unlink(os.path.join(temp_frames_dir, frame_file))
+        os.rmdir(temp_frames_dir)
+        
+        # Clean up input file
+        try:
+            os.unlink(temp_input.name)
+        except:
+            pass
+
+        # Verify output
+        if not os.path.exists(temp_output_path) or os.path.getsize(temp_output_path) == 0:
+            return JSONResponse(status_code=500, content={
+                "error": "Output video file was not created or is empty"
+            })
+
+        file_size = os.path.getsize(temp_output_path)
+        print(f"Web-compatible video created: {temp_output_path}, size: {file_size} bytes")
+
+        # Handle range requests for video streaming
+        range_header = request.headers.get("range") if request else None
         if range_header:
-            # Parse "bytes=start-end"
-            start, end = range_header.replace("bytes=", "").split("-")
-            start = int(start)
-            end = int(end) if end else file_size - 1
-            chunk_size = (end - start) + 1
+            try:
+                start, end = range_header.replace("bytes=", "").split("-")
+                start = int(start)
+                end = int(end) if end else file_size - 1
+                chunk_size = (end - start) + 1
 
-            def iterfile(path, start, end):
-                with open(path, "rb") as f:
-                    f.seek(start)
-                    yield f.read(chunk_size)
+                def iterfile(path, start, end):
+                    with open(path, "rb") as f:
+                        f.seek(start)
+                        yield f.read(chunk_size)
 
-            headers = {
-                "Content-Range": f"bytes {start}-{end}/{file_size}",
-                "Accept-Ranges": "bytes",
-                "Content-Length": str(chunk_size),
-                "Content-Type": "video/mp4",  # Added explicit content type
-                "Cache-Control": "no-cache",  # Prevent caching issues
-            }
-            return StreamingResponse(iterfile(file_path, start, end),
-                                    status_code=206,
-                                    media_type="video/mp4",
-                                    headers=headers)
+                headers = {
+                    "Content-Range": f"bytes {start}-{end}/{file_size}",
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": str(chunk_size),
+                    "Content-Type": "video/mp4",
+                    "Cache-Control": "no-cache",
+                }
+                return StreamingResponse(
+                    iterfile(temp_output_path, start, end),
+                    status_code=206,
+                    media_type="video/mp4",
+                    headers=headers
+                )
+            except Exception as e:
+                print(f"Range request failed: {e}")
 
-        # fallback: full file with proper headers
+        # Return full file
         headers = {
             "Content-Type": "video/mp4",
             "Accept-Ranges": "bytes",
             "Cache-Control": "no-cache",
+            "Content-Length": str(file_size),
         }
-        return FileResponse(file_path, 
-                          media_type="video/mp4", 
-                          headers=headers,
-                          filename="predicted_video.mp4")
+        
+        return FileResponse(
+            temp_output_path, 
+            media_type="video/mp4", 
+            headers=headers,
+            filename="predicted_video.mp4"
+        )
 
+    except subprocess.TimeoutExpired:
+        return JSONResponse(status_code=500, content={
+            "error": "Video processing timed out"
+        })
     except Exception as e:
+        print(f"Video processing error: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
